@@ -14,12 +14,18 @@ static int static_debug = 1;//调试使用
 //处理http请求
 void do_http_request(int  client_sock);
 //处理读取一行http的报文
-int get_line(int sock, char *buf, int size);
+int  get_line(int sock, char *buf, int size);
 //http服务器的响应
 void do_http_response(int client_socket);
+void do_http_response(int client_socket,const char* path);
+//发送http的头部
+int headers(int client_socket,FILE *resource);
+//发送http的内容
+void cat(int client_socket, FILE* resource);
 //http服务器404响应
 void not_found(int client_socket);
-
+//服务器内部错误
+void inner_error(int client_socket);
 int main(void) {
 	//1创建连接的套接字
 	int sock;	
@@ -126,16 +132,19 @@ void do_http_request(int  client_sock) {
 
 			//执行http的响应
 			//判断客户端要的文件存不存在
-			int ll = stat(path, &st);
-			if (static_debug) printf("stat: %d", ll);
-			if (ll == -1) {//文件不存在
+			if (stat(path, &st) == -1) {//文件不存在
 				//404 找不到资源
+				fprintf(stderr,"stat %s failed,reason:%s\n",path,strerror(errno));
 				not_found(client_sock);
 			}
 			else//文件存在
 			{
+				if (S_ISDIR(st.st_mode)) {
+					strcat(path,"/1.html");
+				
+				}
 				//响应客户端请求的文件
-				do_http_response(client_sock);
+				do_http_response(client_sock,path);
 			}
 			
 		}
@@ -201,7 +210,6 @@ int get_line(int sock, char* buf, int size) {
 }
 
 
-
 void do_http_response(int client_socket) {
 	const char* main_header = "HTTP/1.0 200 OK\r\nSrever: JXF Server\r\nContent-Type:text/html\r\nConnection: Close\r\n";
 	const char* welcome_content = "\
@@ -226,7 +234,6 @@ void do_http_response(int client_socket) {
 				</body>\n\
 			</html>\n\
 			";
-
 	//1发送main_header
 	int len = write(client_socket, main_header,strlen(main_header));
 	if (static_debug) fprintf(stdout,"...do_http_response...\n");
@@ -242,6 +249,25 @@ void do_http_response(int client_socket) {
 	//3发送主体的html内容welcome_content
 	len = write(client_socket, welcome_content, wc_len);
 	if (static_debug) fprintf(stdout, "write[%d]:%s", len, welcome_content);
+
+}
+
+void do_http_response(int client_socket, const char* path) {
+	int res = 0;
+	FILE* resource = NULL;
+	resource = fopen(path, "r");//只读方式打开文件
+	if (resource == NULL) {
+		not_found(client_socket);//打开失败则响应未找到
+		return;
+	}
+
+	//1发送http头部
+	res = headers(client_socket, resource);
+	//2发送http内容
+	if (!res){
+		cat(client_socket, resource);
+	}
+	fclose(resource);
 }
 
 
@@ -258,12 +284,81 @@ void not_found(int client_socket) {
 		</body>\r\n\
 	</html>\r\n\
 	";
-
-	
 	int len = write(client_socket, main_404, strlen(main_404));
 	if (static_debug) printf("len:%d\n", len);
 	if (static_debug) fprintf(stdout, main_404);
 	if (len <= 0) {
 		fprintf(stderr,"send reply failed, reason :%s\n",strerror(errno));
+	}
+}
+
+void inner_error(int client_socket) {
+	const char* main_500 = "HTTP/1.0 500 Internal Server Error\r\n\
+	Content-Type:text/html\r\n\
+	\r\n\
+	<html lang=\"zh-CN\">\r\n\
+		<head>\r\n\
+			<title>Method Not Implemented</title>\r\n\
+		</head>\r\n\
+		<body>\r\n\
+				<p>服务器内部出错!\r\n\
+		</body>\r\n\
+	</html>\r\n\
+	";
+	int len = write(client_socket, main_500, strlen(main_500));
+	if (len <= 0) {
+		fprintf(stderr, "send reply failed, reason :%s\n", strerror(errno));
+	}
+}
+
+
+//发送http的头部(成功返回0 失败返回-1)
+int headers(int client_socket, FILE* resource) {
+	char buf[1024] = { 0 };
+	char tmp[64];
+	struct stat st;
+	int fileid=0;
+
+	strcpy(buf, "HTTP/1.0 200 OK\r\n");
+	strcat(buf, "Srever: JXF Server\r\n");
+	strcat(buf, "Content-Type:text/html\r\n");
+	strcat(buf, "Connection: Close\r\n");
+	
+	//获取文件大小
+	fileid = fileno(resource);		//从文件指针提取文件id
+	if (fstat(fileid, &st) == -1) {	//返回有关文件的信息
+		//返回失败	
+		fprintf(stderr,"提取文件出错!,原因:%s\n",strerror(errno));
+		inner_error(client_socket);	//500响应-内部错误
+		return -1;
+	}
+
+	//返回成功
+	snprintf(tmp,64,"Content-Length: %d\r\n\r\n", st.st_size);
+	strcat(buf, tmp);
+	if (static_debug) fprintf(stdout, "header:%s\n", buf);
+
+	if (send(client_socket, buf, strlen(buf), 0)<0) {
+		fprintf(stderr, "服务器内部出错!,原因:%s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
+
+//发送http的内容
+void cat(int client_socket, FILE* resource) {
+	char buf[1024];
+	int len = 0;
+
+	fgets(buf,sizeof(buf), resource);
+	while (!feof(resource)){
+		len = write(client_socket,buf,strlen(buf));
+		if (len<0) {
+			fprintf(stderr, "发送http body错误,原因:%s\n", strerror(errno));
+		}
+
+		if (static_debug) fprintf(stdout, "body:%s\n", buf);
+		fgets(buf, sizeof(buf), resource);
 	}
 }
